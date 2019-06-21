@@ -1,0 +1,912 @@
+<!doctype html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <style>
+        #dragbar {
+            position: absolute;
+            cursor: col-resize;
+            z-index: 10;
+            border: 1px solid #00aa00;
+            background-color: #00ff99;
+        }
+
+        #popup {
+            position: fixed;
+            border: 1px solid #00aa00;
+            background-color: #00ff99;
+            z-index: 3;
+            pointer-events:none;
+        }
+
+        #leftarea {
+            position: relative;
+            display: block;
+            box-sizing: border-box;
+            float: left;
+            height: 100%;
+            width: 10%;
+            line-height: normal;
+            font-family: Consolas, monospace;
+            font-size: 15px;
+        }
+
+        #textarea {
+            overflow: auto;
+            height: 50%;
+            width: 100%;
+            border-bottom: 1px solid #00aa00;
+        }
+
+        #layersarea {
+            overflow: auto;
+            width: 100%;
+            height: 47%;
+        }
+
+        #framearea {
+            border-top: 1px solid #00aa00;
+            position: absolute;
+            bottom: 0;
+            height: 3%;
+            width: 100%;
+        }
+
+        #currentframe {
+            display: inline
+        }
+
+        #framenumber {
+            display: inline
+        }
+
+        #canvascontainer {
+            display: block;
+            box-sizing: border-box;
+            float: right;
+            height: 100%;
+            width: 90%;
+        }
+
+        html, body {
+            height: 100%;
+            margin: 0;
+            overflow: hidden;
+        }
+    </style>
+    <script src="https://pixijs.download/v5.0.0-rc.3/pixi.js"></script>
+</head>
+<body>
+<div id="popup"></div>
+<div id="dragbar"></div>
+<div id="leftarea">
+    <div id="textarea"></div>
+    <div id="layersarea"></div>
+    <div id="framearea">
+        <div id="currentframe"></div>
+        <div id="framenumber"></div>
+    </div>
+</div>
+<div id="canvascontainer"></div>
+<script type="text/javascript">
+
+    let CONFIG_MAX_LAYERS = 100;
+    let disabled_layer_name = {};
+
+    function getCheckBoxHTMLForLayer(layer, index) {
+        let html =
+            `<p><label><input type='checkbox' onclick='visualizer.handleLayer(this, \"${layer}\");'`;
+        if (!disabled_layer_name[layer]) {
+            html += 'checked';
+        }
+        return html + `>${layer}</label></p>`;
+    }
+
+    function getHTMLForCurrentFrame(current_frame) {
+        let html =
+            `Frame: <input type='textarea' style='width:40px;' value='${current_frame}'
+                    onkeyup='visualizer.handleFrame(this);'>`;
+        return html;
+    }
+
+    function getHTMLForFrameNumber(frame_number) {
+        let html =`of ${frame_number}`;
+        return html;
+    }
+
+
+    // Apply camera transform every frame
+    let CONFIG_APPLY_CAMERA = true;
+
+    // Draw multiply objects in one graphics for better performance,
+    // but can cause artifacts when extremely scaling
+    let CONFIG_MAX_OBJECTS_PER_GRAPHICS = 200;
+
+    // Helper variable for fix mouse popup lag
+    let mouse_over_counter = 0;
+
+    // Helper variable for correct handlind busy indicator
+    let tasks = 0;
+
+    // Helper objects
+    const SPRITE_HITAREA = new PIXI.Rectangle(0, 0, 16, 16);
+
+    const POPUP_DOCUMENT = document.getElementById("popup");
+
+    const MOUSEOVER_POPUP_FUNCTION = function (e, text) {
+        POPUP_DOCUMENT.style.top = e.data.originalEvent.clientY + "px";
+        POPUP_DOCUMENT.style.left = e.data.originalEvent.clientX + 30 + "px";
+        POPUP_DOCUMENT.innerText = text;
+        POPUP_DOCUMENT.style.display = "";
+        mouse_over_counter++;
+    };
+
+    const MOUSEOUT_POPUP_FUNCTION = function(e) {
+        if (mouse_over_counter === 1) {
+            POPUP_DOCUMENT.innerText = "";
+            POPUP_DOCUMENT.style.display = "none";
+        }
+        mouse_over_counter--;
+    };
+
+    // For calculating performance summary time
+    let time = 0;
+
+    // Used for fast draw a lot of squares and interactive squares with text popup
+    class Sprite {
+        constructor() {
+            this.object = null;
+            this.sprite = new PIXI.Sprite(PIXI.Texture.WHITE);
+        }
+
+        setObject(object) {
+            this.object = object;
+            let marker = this.object;
+
+            this.sprite.width = marker[4];
+            this.sprite.height = marker[4];
+
+            this.sprite.tint = marker[3];
+
+            this.sprite.x = marker[0] - marker[4] / 2;
+            this.sprite.y = marker[1] - marker[4] / 2;
+
+            // Popup
+            if (marker[5]) {
+                this.sprite.interactive = true;
+                this.sprite.hitArea = SPRITE_HITAREA;
+                this.sprite.mouseover = function(e) {
+                    MOUSEOVER_POPUP_FUNCTION(e, marker[5]);
+                };
+                this.sprite.mouseout = MOUSEOUT_POPUP_FUNCTION;
+            }
+        }
+
+        objectToSprite(scale) {
+            this.addMarkerToSprite(scale);
+        }
+
+        addMarkerToSprite(scale) {
+            let marker = this.object;
+
+            // If object scale is fixed
+            if (marker[2] === 0) {
+                this.sprite.x = marker[0] - scale * marker[4] / 2;
+                this.sprite.y = marker[1] - scale * marker[4] / 2;
+                this.sprite.width = marker[4] * scale;
+                this.sprite.height = marker[4] * scale;
+            }
+        }
+
+    }
+
+    // Used to draw lines and other complex not interactive stuff
+    // CONFIG_MAX_OBJECTS_PER_GRAPHICS per one graphics
+    class Graphics {
+        constructor() {
+            this.objects = [];
+            this.graphics = new PIXI.Graphics;
+        }
+
+        addObject(object) {
+            this.objects.push(object);
+        }
+
+        objectsToGraphics(scale) {
+            this.clearGraphics();
+            for (let i = 0; i < this.objects.length; i++) {
+                this.addLineToGraphics(this.objects[i], scale);
+            }
+        }
+
+        clearGraphics() {
+            this.graphics.clear();
+        }
+
+        clear() {
+            this.objects = [];
+        }
+
+        addLineToGraphics(line, scale) {
+            this.graphics.moveTo(line[0], line[1]);
+            this.graphics.lineStyle(scale * line[5], line[4]);
+            this.graphics.lineTo(line[2], line[3]);
+        }
+    }
+
+    // Used to keep graphics and sprites
+    class GraphicsContainer {
+        constructor() {
+            this.container = [];
+            for (let i = 0; i < CONFIG_MAX_LAYERS; i++) {
+                this.container.push([[0, []], [0, []]]);
+            }
+        }
+
+        setObjects(lines, markers) {
+            for (let i = 0; i < lines.length; i++) {
+                this.addLineToContainer(lines[i]);
+            }
+            for (let i = 0; i < markers.length; i++) {
+                this.addMarkerToContainer(markers[i]);
+            }
+        }
+
+        addMarkerToContainer(marker) {
+            if (disabled_layer_name[marker[6]]) {
+                return;
+            }
+            let layer_container = this.container[marker[7]][0];
+            let layer_sprites = layer_container[1];
+            if (layer_container[0] >= layer_sprites.length) {
+                layer_sprites.push(new Sprite());
+            }
+            layer_container[0]++;
+            layer_sprites[layer_container[0] - 1].setObject(marker);
+        }
+
+        addLineToContainer(line) {
+            if (disabled_layer_name[line[6]]) {
+                return;
+            }
+            let layer_container = this.container[line[7]][1];
+            let layer_graphics = layer_container[1];
+            if (layer_container[0] === 0 ||
+                layer_graphics[layer_container[0] - 1].objects.length >=
+                    CONFIG_MAX_OBJECTS_PER_GRAPHICS) {
+                if (layer_container[0] >= layer_graphics.length) {
+                    layer_graphics.push(new Graphics());
+                }
+                layer_container[0]++;
+            }
+            layer_graphics[layer_container[0] - 1].addObject(line);
+        }
+
+        objectsToGraphics(stage) {
+            let scale = 1 / stage.scale.x;
+
+            for (let i = 0; i < this.container.length; i++) {
+                let sprites = this.container[i][0][1];
+                let sprites_length = this.container[i][0][0];
+                for (let j = 0; j < sprites_length; j++) {
+                    sprites[j].objectToSprite(scale);
+                }
+                let graphics = this.container[i][1][1];
+                let graphics_length = this.container[i][1][0];
+                for (let j = 0; j < graphics_length; j++) {
+                    graphics[j].objectsToGraphics(scale);
+                }
+            }
+        }
+
+        addToStage(stage) {
+            let t = performance.now();
+
+            this.objectsToGraphics(stage);
+            
+            console.log("objects to graphics", performance.now() - t, performance.now() - time);
+
+            t = performance.now();
+            
+            stage.removeChildren();
+            
+            console.log("remove children", performance.now() - t, performance.now() - time);
+
+            t = performance.now();
+            
+            for (let i = 0; i < this.container.length; i++) {
+                let sprites = this.container[i][0][1];
+                let sprites_length = this.container[i][0][0];
+                for (let j = 0; j < sprites_length; j++) {
+                    stage.addChild(sprites[j].sprite);
+                }
+                let graphics = this.container[i][1][1];
+                let graphics_length = this.container[i][1][0];
+                for (let j = 0; j < graphics_length; j++) {
+                    stage.addChild(graphics[j].graphics);
+                }
+            }
+            
+            console.log("add children", performance.now() - t, performance.now() - time);
+        }
+
+        makeCurrent(frame, stage) {
+            let t = performance.now();
+
+            this.setObjects(frame.lines, frame.markers);
+
+            console.log(
+                "setObjects: ", performance.now() - t, performance.now() - time);
+
+            this.addToStage(stage);
+
+            if (CONFIG_APPLY_CAMERA) {
+                let client_width = document.getElementById("canvascontainer").clientWidth;
+                let client_height = document.getElementById("canvascontainer").clientHeight;
+                stage.setTransform(
+                    client_width / 10, // x
+                    client_height / 2, // y
+                    stage.scale.x,
+                    stage.scale.y,
+                    frame.camera[2], // yaw
+                    0,
+                    0,
+                    frame.camera[1], // camera x
+                    frame.camera[0], // camera y
+
+                )
+            }
+
+
+            t = performance.now();
+            let messages_text = [];
+            for (let i = 0; i < frame.messages.length; i++) {
+                if (disabled_layer_name[frame.messages[i][3]]) {
+                    continue;
+                }
+                messages_text.push(frame.messages[i][2]);
+            }
+            document.getElementById("textarea").innerText = messages_text.join('');
+            console.log("add messages", performance.now() - t, performance.now() - time);
+
+            let layers_checkboxes_html = "";
+            for (let layer in frame.layer_indexes) {
+                let index = frame.layer_indexes[layer];
+                layers_checkboxes_html += getCheckBoxHTMLForLayer(layer, index);
+            }
+            document.getElementById('layersarea').innerHTML = layers_checkboxes_html;
+        }
+
+        clear() {
+            for (let i = 0; i < this.container.length; i++) {
+                this.container[i][0][0] = 0;
+
+                let grapgics = this.container[i][1][1];
+                let graphics_length = this.container[i][1][0];
+                for (let j = 0; j < graphics_length; j++) {
+                    grapgics[j].clear();
+                }
+                this.container[i][1][0] = 0;
+            }
+        }
+    }
+
+    class Frame {
+        constructor(camera, layer_indexes, lines, markers, messages) {
+            this.camera = camera;
+
+            this.layer_indexes = {};
+            for (let i = 0; i < layer_indexes.length; i++) {
+                this.layer_indexes[layer_indexes[i][1]] = layer_indexes[i][0];
+            }
+
+            for (let i = 0; i < lines.length; i++) {
+                lines[i][7] = this.layer_indexes[lines[i][6]];
+                if (lines[i][7] === undefined) {
+                    lines[i][7] = 0;
+                    this.layer_indexes[lines[i][6]] = 0;
+                }
+            }
+            this.lines = lines;
+
+            for (let i = 0; i < markers.length; i++) {
+                markers[i][7] = this.layer_indexes[markers[i][6]];
+                if (markers[i][7] === undefined) {
+                    markers[i][7] = 0;
+                    this.layer_indexes[markers[i][6]] = 0;
+                }
+            }
+            this.markers = markers;
+
+            this.messages = messages;
+
+            this.loaded = true;
+        }
+
+        clear() {
+            this.layer_indexes = {};
+            this.lines = [];
+            this.markers = [];
+            this.messages = [];
+
+            this.loaded = false;
+        }
+    }
+
+    class Visualizer {
+
+        constructor() {
+            self = this;
+
+            this.connected = false;
+
+            this.frames = [];
+            this.loadedFrame = -1;
+            this.currentFrame = -1;
+
+            this.renderer = new PIXI.Renderer();
+            this.renderer.resize(
+                document.getElementById("canvascontainer").clientWidth,
+                document.getElementById("canvascontainer").clientHeight);
+            this.renderer.backgroundColor = 0xF0FFFF;
+            this.renderer.interactive = true;
+
+            document.getElementById("canvascontainer").appendChild(this.renderer.view);
+
+            this.stage = new PIXI.Container();
+
+            this.stage.scale.x = 20;
+            this.stage.scale.y = 20;
+
+
+            this.graphicsContainer = new GraphicsContainer();
+
+            this.mouse_is_down = false;
+            this.mouse_down_x = 0;
+            this.mouse_down_y = 0;
+
+            this.addListeners();
+
+            this.connectToServer("ws://127.0.0.1:8080/send_message_to_visualiser");
+
+            this.render(false);
+        }
+
+        connectToServer(websocketServerLocation) {
+            console.log("try to connect");
+
+            this.ws = new WebSocket(websocketServerLocation);
+            this.ws.binaryType = 'arraybuffer';
+
+            this.ws.onopen = function () {
+                console.log("open");
+
+                this.connected = true;
+
+                document.getElementById("currentframe").innerHTML =
+                    getHTMLForCurrentFrame(this.loadedFrame);
+            }.bind(this);
+
+            this.ws.onmessage = function (message) {
+                message = message.data;
+                if (typeof message === "object") {
+
+                    console.log("network time:", performance.now() - time);
+
+                    let t = performance.now();
+
+                    let data_view = new DataView(message);
+                    let offset = 0;
+
+                    let frame_id = data_view.getUint32(offset, true);
+                    offset += 4;
+
+                    console.log("got frame number:", frame_id);
+
+                    let camera_x = data_view.getFloat64(offset, true);
+                    offset += 8;
+                    let camera_y = data_view.getFloat64(offset, true);
+                    offset += 8;
+                    let camera_angle = data_view.getFloat64(offset, true);
+                    offset += 8;
+
+                    let layer_indexes_number = data_view.getUint32(offset, true);
+                    offset += 4;
+                    let layer_indexes = [];
+                    for (let i = 0; i < layer_indexes_number; i++) {
+                        let index = data_view.getUint32(offset, true);
+                        offset += 4;
+                        let name_length = data_view.getUint32(offset, true);
+                        offset += 4;
+                        let name = new TextDecoder("utf-8").decode(
+                            new Uint8Array(message, offset, name_length));
+                        offset += name_length;
+                        layer_indexes.push([index, name]);
+                    }
+
+                    let lines_number = data_view.getUint32(offset, true);
+                    offset += 4;
+                    let lines = [];
+                    for (let i = 0; i < lines_number; i++) {
+                        let x1 = data_view.getFloat64(offset, true);
+                        offset += 8;
+                        let y1 = data_view.getFloat64(offset, true);
+                        offset += 8;
+                        let x2 = data_view.getFloat64(offset, true);
+                        offset += 8;
+                        let y2 = data_view.getFloat64(offset, true);
+                        offset += 8;
+                        let width = data_view.getFloat64(offset, true);
+                        offset += 8;
+                        let color = data_view.getUint32(offset, true);
+                        offset += 4;
+                        let layer_length = data_view.getUint32(offset, true);
+                        offset += 4;
+                        let layer = new TextDecoder("utf-8").decode(
+                            new Uint8Array(message, offset, layer_length));
+                        offset += layer_length;
+                        lines.push([y1, x1, y2, x2, color, width, layer, 0 /*z_index*/]);
+                    }
+
+                    let markers_number = data_view.getUint32(offset, true);
+                    offset += 4;
+                    let markers = [];
+                    for (let i = 0; i < markers_number; i++) {
+                        let x = data_view.getFloat64(offset, true);
+                        offset += 8;
+                        let y = data_view.getFloat64(offset, true);
+                        offset += 8;
+                        let scalable = data_view.getUint32(offset, true);// Idk why uint8 not work !
+                        offset += 4;
+                        let color = data_view.getUint32(offset, true);
+                        offset += 4;
+                        let width = data_view.getFloat64(offset, true);
+                        offset += 8;
+                        let text_length = data_view.getUint32(offset, true);
+                        offset += 4;
+                        let text = new TextDecoder("utf-8").decode(
+                            new Uint8Array(message, offset, text_length));
+                        offset += text_length;
+                        let layer_length = data_view.getUint32(offset, true);
+                        offset += 4;
+                        let layer = new TextDecoder("utf-8").decode(
+                            new Uint8Array(message, offset, layer_length));
+                        offset += layer_length;
+                        markers.push([y, x, scalable, color, width, text, layer, 0 /*z_index*/]);
+                    }
+
+                    let messages_number = data_view.getUint32(offset, true);
+                    offset += 4;
+                    let messages = [];
+                    for (let i = 0; i < messages_number; i++) {
+                        let color = data_view.getUint32(offset, true);
+                        offset += 4;
+                        let width = data_view.getUint32(offset, true);
+                        offset += 4;
+                        let text_length = data_view.getUint32(offset, true);
+                        offset += 4;
+                        let text = new TextDecoder("utf-8").decode(
+                            new Uint8Array(message, offset, text_length));
+                        offset += text_length;
+                        let layer_length = data_view.getUint32(offset, true);
+                        offset += 4;
+                        let layer = new TextDecoder("utf-8").decode(
+                            new Uint8Array(message, offset, layer_length));
+                        offset += layer_length;
+                        messages.push([color, width, text, layer]);
+                    }
+
+                    console.log(
+                        "parsing time:", performance.now() - t, performance.now() - time);
+
+                    this.loadFrameFromServer(
+                        frame_id,
+                        [camera_x, camera_y, camera_angle],
+                        layer_indexes,
+                        lines,
+                        markers,
+                        messages);
+                    this.endBusy();
+
+                } else {
+                    time = performance.now();
+
+                    let data = JSON.parse(message);
+
+                    let parsing = performance.now() - time;
+
+                    if (data.type == "frames_number") {
+                        console.log(data.type, " ", data.frames_number);
+                        this.frames.length = data.frames_number;
+                        document.getElementById("framenumber").innerHTML =
+                            getHTMLForFrameNumber(this.frames.length);
+                    } else if (data.type == "reset") {
+                        console.log(data.type);
+                        visualizer.deactivateLoadedFrame();
+                        this.currentFrame = -1;
+                        this.frames.length = 0;
+                        this.render(false);
+                    }
+                }
+            }.bind(this);
+
+            this.ws.onclose = function () {
+                this.connected = false;
+                setTimeout(function () {
+                    this.connectToServer(websocketServerLocation)
+                }.bind(this), 3000);
+            }.bind(this);
+        }
+
+        addListeners() {
+
+            window.addEventListener('resize', function resize() {
+                this.renderer.resize(
+                    document.getElementById("canvascontainer").clientWidth,
+                    document.getElementById("canvascontainer").clientHeight);
+                this.render(false);
+            }.bind(this));
+
+            window.addEventListener('keypress', function (e) {
+            }.bind(this));
+
+            window.addEventListener('keydown', function (e) {
+                if (e.keyCode == '37') {
+                    this.tryLoadFrame(this.currentFrame - 1);
+                } else if (e.keyCode == '39') {
+                    this.tryLoadFrame(this.currentFrame + 1);
+                }
+            }.bind(this));
+
+            this.renderer.plugins.interaction.on('mousedown', function (e) {
+                this.mouse_is_down = true;
+                this.mouse_down_x = e.data.global.x;
+                this.mouse_down_y = e.data.global.y;
+            }.bind(this));
+
+            this.renderer.plugins.interaction.on('mouseup', function (e) {
+                this.mouse_is_down = false;
+            }.bind(this));
+
+            this.renderer.plugins.interaction.on('mouseup', function (e) {
+                this.mouse_is_down = false;
+            }.bind(this));
+
+            this.renderer.plugins.interaction.on('mouseout', function (e) {
+                this.mouse_is_down = false;
+            }.bind(this));
+
+            this.renderer.plugins.interaction.on('mouseover', function (e) {
+                this.mouse_is_down = false;
+            }.bind(this));
+
+            this.renderer.plugins.interaction.on('mouseupoutside', function (e) {
+                this.mouse_is_down = false;
+            }.bind(this));
+
+            this.renderer.plugins.interaction.on('mousemove', function (e) {
+                if (!this.mouse_is_down) {
+                    return;
+                }
+                let delta_x = e.data.global.x - this.mouse_down_x;
+                let delta_y = e.data.global.y - this.mouse_down_y;
+                this.mouse_down_x = e.data.global.x;
+                this.mouse_down_y = e.data.global.y;
+                this.stage.x = this.stage.x + delta_x;
+                this.stage.y = this.stage.y + delta_y;
+                this.render(false);
+            }.bind(this));
+
+            this.renderer.view.addEventListener("wheel", function (e) {
+                let zoom_in = e.deltaY < 0;
+                let zoom_factor;
+                if (zoom_in) {
+                    zoom_factor = 1.2;
+                } else {
+                    zoom_factor = (1 / 1.2);
+                }
+                this.stage.scale.x *= zoom_factor;
+                this.stage.scale.y *= zoom_factor;
+                let mouse_loc = this.renderer.plugins.interaction.eventData.data.global;
+                this.stage.x -= (mouse_loc.x - this.stage.x) * (zoom_factor - 1);
+                this.stage.y -= (mouse_loc.y - this.stage.y) * (zoom_factor - 1);
+                e.preventDefault();
+
+                time = performance.now();
+                this.startBusy();
+
+                setTimeout(function () {
+                    this.rescale();
+                    console.log("rescaling time:", performance.now() - time);
+                    this.render(false);
+
+                    this.endBusy();
+                }.bind(this), 0);
+
+            }.bind(this));
+        }
+
+        startBusy() {
+            tasks++;
+            if (tasks === 1) {
+                document.getElementById('framearea').style.backgroundColor = "#FF0000";
+            }
+        }
+
+        endBusy() {
+            tasks--;
+            if (tasks === 0) {
+                document.getElementById('framearea').style.backgroundColor = "#FFFFFF";
+            }
+        }
+
+        rescale() {
+            if (this.loadedFrame > -1) {
+                this.graphicsContainer.objectsToGraphics(this.stage);
+            }
+        }
+
+        loadFrameFromServer(frame_id, camera, layer_indexes, lines, markers, messages) {
+            let t = performance.now();
+
+            this.frames[frame_id] = new Frame(camera, layer_indexes, lines, markers, messages);
+
+            console.log(
+                "creating frame time:", performance.now() - t, performance.now() - time);
+
+            this.activateFrame(frame_id);
+        }
+
+        tryLoadFrame(frame_id) {
+            if (frame_id >= this.frames.length || frame_id < 0) {
+                return;
+            }
+            time = performance.now();
+            if (this.frames[frame_id] !== undefined && this.frames[frame_id].loaded) {
+                // cache is now disabled
+                this.activateFrame(frame_id);
+                console.log("from cache frame: " + frame_id);
+            } else { // go to server
+                this.startBusy();
+                this.ws.send("get_frame: " + frame_id);
+                console.log("send: ", "get_frame: " + frame_id);
+            }
+            this.currentFrame = frame_id;
+        }
+
+        render(new_frame) {
+            self = this;
+            self.startBusy();
+            setTimeout(function () {
+                requestAnimationFrame(
+                    function () {
+                        let t = performance.now();
+                        self.renderer.render(self.stage);
+                        if (new_frame) {
+                            console.log(
+                                "rendering time:", performance.now() - t,
+                                performance.now() - time);
+                        } else {
+                            console.log(
+                                "rendering time:", performance.now() - t);
+                        }
+                    }
+                );
+                self.endBusy();
+            }, 0);
+
+        }
+
+        deactivateLoadedFrame(clear_frame) {
+            if (this.loadedFrame > -1) {
+                let t = performance.now();
+
+                if (clear_frame) {
+                    this.frames[this.loadedFrame].clear();
+                }
+                this.graphicsContainer.clear();
+                this.loadedFrame = -1;
+
+                console.log(
+                    "deactivating frame time:", performance.now() - t,
+                    performance.now() - time);
+            }
+        }
+
+        activateFrame(frame_id) {
+            this.startBusy();
+            setTimeout(function () {
+                this.deactivateLoadedFrame(frame_id !== this.loadedFrame);
+                if (frame_id > -1) {
+                    this.graphicsContainer.makeCurrent(this.frames[frame_id], this.stage);
+                }
+                this.loadedFrame = frame_id;
+                this.render(true);
+                document.getElementById("currentframe").innerHTML =
+                    getHTMLForCurrentFrame(frame_id);
+                this.endBusy();
+            }.bind(this), 0);
+
+        }
+
+
+        handleLayer(check_button, layer) {
+            time = performance.now();
+            if (check_button.checked) {
+                if (disabled_layer_name[layer]) {
+                    disabled_layer_name[layer] = false;
+                    this.activateFrame(this.loadedFrame);
+                }
+            } else {
+                if (!disabled_layer_name[layer]) {
+                    disabled_layer_name[layer] = true;
+                    this.activateFrame(this.loadedFrame);
+                }
+            }
+        }
+
+        handleFrame(el) {
+            if(event.key === 'Enter') {
+                try {
+                    let new_frame_number = parseInt(el.value);
+                    this.tryLoadFrame(new_frame_number)
+                } catch (e) { // todo this dont work
+                    alert("Cant parse frame number:" + el.value)
+                }
+            }
+        }
+
+    }
+
+    PIXI.settings.GC_MODE = PIXI.GC_MODES.MANUAL;
+    let visualizer = new Visualizer(requestAnimationFrame);
+
+</script>
+<script> // All about dragbar
+    function getStyleValue(element, style) {
+        return window.getComputedStyle(element, null).getPropertyValue(style);
+    }
+
+    let dragging = false;
+
+    function moveDragBar() {
+        let leftAreaSize =
+            Number(getStyleValue(document.getElementById("leftarea"), "width").replace("px", ""));
+        document.getElementById("dragbar").style.width = "10px";
+        document.getElementById("dragbar").style.top = "0px";
+        document.getElementById("dragbar").style.left = leftAreaSize + "px";
+        document.getElementById("dragbar").style.height = "100%";
+    }
+
+    function endDrag() {
+        dragging = false;
+    }
+
+    function dragMove(e) {
+        if (dragging) {
+            var percentage = ((e.pageX - 10) / window.innerWidth) * 100;
+            if (percentage >= 0 && percentage <= 100) {
+                var mainPercentage = 100 - percentage;
+                document.getElementById("leftarea").style.width = percentage + "%";
+                document.getElementById("canvascontainer").style.width = mainPercentage + "%";
+                moveDragBar();
+            }
+        }
+    }
+
+    function dragStart(e) {
+        e.preventDefault();
+        dragging = true;
+    }
+
+    document.getElementById("dragbar").addEventListener("mousedown", function (e) {
+        dragStart(e);
+    });
+    window.addEventListener("mousemove", function (e) {
+        dragMove(e);
+    });
+    window.addEventListener("mouseup", endDrag);
+    window.addEventListener("load", moveDragBar);
+</script>
+</body>
+</html>
